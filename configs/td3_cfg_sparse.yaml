@@ -1,0 +1,28 @@
+algorithm_cfg:
+  batch_size: 128
+  learning_starts: 50000
+  n_eval_episodes: 300
+  max_steps: 250
+  start_pretrained: 1000000
+  self-training_threshold: 0.9
+  action_noise: 0.1
+  noise: "golden"
+  policy_delay: 2
+  target_policy_noise: 0.2
+  target_noise_clip: 0.5
+  opponent_noise_type: "none"
+  opponent_noise: 0.05
+log_cfg:
+  log_dir: /home/borakargi/Personal/logs
+  log_filename_suffix: td3-base
+optim_cfg:
+  actor_config:
+    lr: 0.00001
+    # weight_decay: 0.00001
+  critic_config:
+    lr: 0.00001
+reward_cfg:
+  winner: 10.0
+  reward_touch_puck: 0.0
+  reward_closeness_to_puck: 0.05
+  reward_puck_direction: 0.0
