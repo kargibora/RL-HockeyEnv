@@ -1,0 +1,6 @@
+self_play_cfg:
+  eval_pretrained_agents:
+    - /home/borakargi/Personal/models/TD3-gaussian-dense-ep_5e6-lr3e-4-gamma-0.95-b128_Hockey-v0_0_2025-02-21-21-39-54
+    - /home/borakargi/Personal/models/TD3-pink-dense-ep_5e6-lr3e-4-gamma-0.95-b128_Hockey-v0_0_2025-02-22-01-02-28
+    - /home/borakargi/Personal/models/TD3-golden-dense-ep_5e6-lr3e-4-gamma-0.95-b128_Hockey-v0_0_2025-02-22-10-09-54
+    - /home/borakargi/Personal/models/TD3-brown-dense-ep_5e6-lr3e-4-gamma-0.95-b128_Hockey-v0_0_2025-02-23-20-13-41

@@ -1,5 +1,6 @@
 """
-The code is mostly fetched&inspired from https://github.com/openai/baselines/tree/master
+The code is mostly from https://github.com/openai/baselines/tree/master
+Although the code is inspired from the above source, it has been modified to suit the needs of the project.
 """
 import operator
 import numpy as np
@@ -196,6 +197,16 @@ class PrioritizedReplayBuffer:
         self._it_min = MinSegmentTree(tree_capacity)
         self._max_priority = 1.0
 
+    def scale_alpha(self, step, beta):
+        """
+        Scale the prioritization factor alpha according to the current step.
+        
+        Parameters:
+            step (int): Current training step.
+            beta (float): Final value for the prioritization factor.
+        """
+        self._alpha = min(1.0, self._alpha + (beta - self._alpha) * step / beta)
+        
     def add(self, state, action, next_state, reward, done):
         """
         Insert a new transition into the buffer.
@@ -268,7 +279,9 @@ class PrioritizedReplayBuffer:
             p_sample = self._it_sum[idx] / self._it_sum.sum(0, self.size - 1)
             weight = (p_sample * self.size) ** (-beta)
             weights.append(weight / max_weight)
+
         weights = np.array(weights)
+        indices = np.array(indices)
 
         data = self._fetch_data(indices)
         return data, weights, indices

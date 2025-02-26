@@ -164,6 +164,6 @@ def sample_golden_noise(shape: tuple) -> torch.Tensor:
 def sample_pink_noise(shape: tuple) -> torch.Tensor:
     return sample_colored_noise(shape, beta=1.0)
 
-
-
+def sample_brown_noise(shape: tuple) -> torch.Tensor:
+    return sample_colored_noise(shape, beta=2.0)
 

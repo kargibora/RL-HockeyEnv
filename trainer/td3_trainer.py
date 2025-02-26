@@ -3,9 +3,10 @@ import torch.nn as nn
 import torch.nn.functional as F
 import numpy as np
 
-from methods.td3 import TD3
+from methods.td3 import TD3, load_td3_agent_from_chkpt
 from utils.replay_buffer import ReplayBuffer
-from utils.noise import sample_pink_noise, sample_gaussian_noise, sample_golden_noise
+from utils.per import PrioritizedReplayBuffer
+from utils.noise import sample_pink_noise, sample_gaussian_noise, sample_golden_noise, sample_brown_noise
 from utils.rewards import calculate_dense_rewards_with_weights
 
 from typing import Any
@@ -18,8 +19,9 @@ from torch.utils.tensorboard import SummaryWriter
 from typing import Dict
 import copy
 import cv2
+import logging
 
-class TD3Algorithm():
+class TD3Trainer():
     def __init__(
         self,
         env,
@@ -30,6 +32,7 @@ class TD3Algorithm():
         optimizer_config: tuple[dict[str, Any]],
         reward_config: dict[str, Any],
         log_config: dict[str, Any],
+        self_play_config: dict[str, Any],
         gamma: float,
         device,
     ) -> None:
@@ -40,9 +43,14 @@ class TD3Algorithm():
         self.algorithm_config = algorithm_config
         self.optimizer_config = optimizer_config
         self.reward_config = reward_config
+        self.self_play_config = self_play_config
         self.env_config = env_config
         self.log_config = log_config
         self.gamma = gamma
+
+        self.starting_beta = self.algorithm_config["beta"]
+        self.ending_beta = 1.0
+        self.current_beta = self.starting_beta
 
         self.critic_criterion = nn.MSELoss()
         self.critic_optimizer = torch.optim.Adam(
@@ -69,6 +77,8 @@ class TD3Algorithm():
             self.sample_noise_f = sample_pink_noise
         elif self.algorithm_config["noise"] == "golden":
             self.sample_noise_f = sample_golden_noise
+        elif self.algorithm_config["noise"] == "brown":
+            self.sample_noise_f = sample_brown_noise
         else:
             raise NotImplementedError
         
@@ -80,10 +90,10 @@ class TD3Algorithm():
                 filename_suffix=self.log_config["log_filename_suffix"],
             )
 
-        self.pretrained_added = False   
-        self.best_win_percentage = 0.0
-        self.best_win_percentage_strong = 0.0
-        self.pretrained_countdown = 0.0
+        self.best_win_percentage = 0
+        self.best_win_percentage_strong = 0
+        self.best_win_percentage_weak = 0
+        self.pretrained_countdown = 0
         self.best_agent = None
         
         self.reward_betas = [
@@ -92,76 +102,106 @@ class TD3Algorithm():
             self.reward_config['reward_closeness_to_puck'],
             self.reward_config['reward_puck_direction'],
         ]
-    def train(self, n_steps: int) -> None:
-        num_collected_observations = 0
 
-        self.total_timesteps = n_steps
-        self.start_pretrained = self.algorithm_config["start_pretrained"]
-        self.pretrained_countdown = 0
-        self.self_training_threshold = self.algorithm_config["self-training_threshold"]
-        self.pretrained_added = False
+        self.self_train = self.self_play_config.get('self_train', False)
+        self.self_playing_threshold = self.self_play_config.get('self_playing_threshold', 1.0)
+        self.self_training_max_agents = self.self_play_config.get('self_training_max_agents', 5)
 
-        # Collect and augment observations
-        last_observation_1, _ = self.env.reset()
-        self.last_observation_1 = last_observation_1
-        self.last_observation_2 = self.env.obs_agent_two()
+        self.start_pretrained = self.self_play_config.get('start_pretrained', None)
+        self.pretrained_added = False   
 
-         # Instantiate opponents to train and evaluate against
+
+    def setup_default_opponents(self):
+        # Create basic opponents for evaluation and training
         self.weak_opponent = BasicOpponent(weak=True)
-        self.weak_opponent.agent_config = {"type": "basic", "name": "weak"}
         self.strong_opponent = BasicOpponent(weak=False)
-        self.strong_opponent.agent_config = {"type": "basic", "name": "strong"}
 
-        # Set opponents for training and evaluation
+        self.weak_opponent.name = "weak"
+        self.strong_opponent.name = "strong"
+
+        # Set up opponent lists
         self.opponents = [self.weak_opponent]
         self.self_training_opponents = []
         self.eval_opponents = [self.weak_opponent, self.strong_opponent]
+        self.eval_pretrained_opponents = [self.weak_opponent, self.strong_opponent]
         self.train_opponents = []
 
-         # Just 'opponents' -> used for training and evaluation
-        # if "opponents" in self.algorithm_config:
-        #     opponents_temp = load_agents(self.algorithm_config["opponents"])
-        #     self.eval_opponents.extend(opponents_temp)
-        #     self.train_opponents.extend(opponents_temp)
-        # # 'opponents_train' -> used for training, but not evaluation
-        # if "opponents_train" in self.algorithm_config:
-        #     self.train_opponents.extend(
-        #         load_agents(self.algorithm_config["opponents_train"])
-        #     )
-        # # 'opponents_eval' -> used for evaluation, but not training
-        # if "opponents_eval" in self.algorithm_config:
-        #     self.eval_opponents.extend(
-        #         load_agents(self.algorithm_config["opponents_eval"])
-        #     )
+    def get_current_progress(self):
+        return self.num_timesteps / self.total_timesteps
+    
+    def train(self, n_steps: int) -> None:
+        num_collected_observations = 0
 
+        # Initialize training parameters
+        self.total_timesteps = n_steps
+        self.pretrained_countdown = 0
+        self.pretrained_added = False
+
+        # Reset the environment and store initial observations
+        last_obs, _ = self.env.reset()
+        self.last_observation_agent = last_obs
+        self.last_observation_opponent = self.env.obs_agent_two()
+
+        self.setup_default_opponents()
+        # Load pretrained evaluation agents
+        eval_agents = self.self_play_config.get('eval_pretrained_agents', [])
+        for i, agent_chkpt in enumerate(eval_agents):
+            eval_agent = load_td3_agent_from_chkpt(
+                agent_chkpt,
+                model_name='_model',
+                state_dim=self.agent.state_dim,
+                action_dim=self.agent.action_dim,
+                max_action=self.agent.max_action,
+            )
+            eval_agent.name = f"EvalAgent_{i}"
+            logging.info(f"[EVAL] Loaded pretrained agent {eval_agent.name}")
+            self.eval_pretrained_opponents.append(eval_agent)
+
+        # Load pretrained training agents
+        train_agents = self.self_play_config.get('train_pretrained_agents', [])
+        for i, agent_chkpt in enumerate(train_agents):
+            train_agent = load_td3_agent_from_chkpt(
+                agent_chkpt,
+                model_name='_model',
+                state_dim=self.agent.state_dim,
+                action_dim=self.agent.action_dim,
+                max_action=self.agent.max_action,
+            )
+            train_agent.name = f"TrainAgent_{i}"
+            logging.info(f"[TRAIN] Loaded pretrained agent {train_agent.name}")
+            self.train_opponents.append(train_agent)
+
+        # Main training loop with progress tracking
         pbar = tqdm.tqdm(total=n_steps)
         while self.num_timesteps < self.total_timesteps:
-
-            # First, fill the replay buffer by randomly sampling episode
+            # Collect rollout samples and update observation count
             n_gradient_steps = self.rollout_collect()
-            num_collected_observations += n_gradient_steps # Can terminate early with done
+            num_collected_observations += n_gradient_steps
 
+            # Begin training once sufficient observations have been gathered
             if num_collected_observations > self.learning_starts:
                 self.train_agent_steps(num_steps=n_gradient_steps)
                 pbar.update(n_gradient_steps)
 
-                # Add strong opponent after exploration
+                # Add the strong opponent once exploration is underway
                 if self.strong_opponent not in self.opponents:
                     self.opponents.append(self.strong_opponent)
 
+                # Introduce pretrained agents when performance criteria are met
                 if not self.pretrained_added:
-                    if self.best_win_percentage_strong > self.self_training_threshold:
+                    if self.best_win_percentage_strong > self.self_playing_threshold:
                         self.pretrained_countdown += n_gradient_steps
 
-                    if self.pretrained_countdown >= self.start_pretrained:
+                    if self.start_pretrained and self.pretrained_countdown >= self.start_pretrained:
+                        logging.info("Adding pretrained agents to the pool")
                         for agent in self.train_opponents:
                             self.opponents.append(agent)
 
+                        for agent in self.eval_pretrained_opponents:
+                            self.eval_opponents.append(agent)
+
                         self.pretrained_added = True
 
-    def sample_opponent_noise(self, noise_std: float, shape) -> np.ndarray:
-        """Sample noise for the opponent's action."""
-        return np.random.normal(0, noise_std, shape)
 
     def choose_opponent(self, opponents) -> object:
         """Randomly select an opponent from the available pool."""
@@ -180,31 +220,20 @@ class TD3Algorithm():
 
         # Choose an opponent and determine the noise parameters.
         current_opponent = self.choose_opponent(self.opponents + self.self_training_opponents)
-        noise_mode = self.algorithm_config["opponent_noise_type"]
-        if noise_mode == "none":
-            opp_noise_std = 0.0
-        elif noise_mode == "gaussian":
-            opp_noise_std = self.algorithm_config["opponent_noise"]
-        elif noise_mode == "exp":
-            beta = self.algorithm_config["opponent_noise"]
-            opp_noise_std = np.random.exponential(beta)
-        else:
-            opp_noise_std = 0.0
 
         step_idx = 0
         with torch.no_grad():
             while step_idx <= max_episode_steps:
                 # Compute the agent's action with added noise.
                 current_noise = base_action_noise * noise_sequence[step_idx]
-                agent_action = self.agent.act(self.last_observation_1, current_noise)
+                agent_action = self.agent.act(self.last_observation_agent, current_noise)
 
                 # Compute the opponent's action and add Gaussian noise.
-                opp_action = current_opponent.act(self.last_observation_2)
-                noise_sample = self.sample_opponent_noise(opp_noise_std, opp_action.shape)
-                opp_action_noisy = np.clip(opp_action + noise_sample, -1.0, 1.0)
+                opp_action = current_opponent.act(self.last_observation_opponent)
+                opp_action = np.clip(opp_action, -1.0, 1.0)
 
                 # Merge both actions.
-                combined_action = np.hstack((agent_action, opp_action_noisy))
+                combined_action = np.hstack((agent_action, opp_action))
 
                 # Step the environment.
                 new_state, reward, done, _, info = self.env.step(combined_action)
@@ -219,7 +248,13 @@ class TD3Algorithm():
                 # Convert observations and actions to torch tensors.
                 new_state_tensor = torch.from_numpy(new_state.astype(np.float32))
                 agent_action_tensor = torch.from_numpy(agent_action.astype(np.float32))
-                last_state_tensor = torch.from_numpy(self.last_observation_1)
+                last_state_tensor = torch.from_numpy(self.last_observation_agent)
+
+                if isinstance(self.replay_buffer, PrioritizedReplayBuffer):
+                    # Beta should start from low value and gradually increase to 1
+                    run_ratio = self.get_current_progress()
+                    # Slowly scale beta to 1
+                    self.beta = self.starting_beta + run_ratio * (self.ending_beta - self.starting_beta)
 
                 # Store the transition in the replay buffer.
                 self.replay_buffer.add(
@@ -234,12 +269,12 @@ class TD3Algorithm():
 
                 # Check if the episode has ended or maximum steps reached.
                 if done or step_idx == max_episode_steps:
-                    self.last_observation_1, _ = self.env.reset()
-                    self.last_observation_2 = self.env.obs_agent_two()
+                    self.last_observation_agent, _ = self.env.reset()
+                    self.last_observation_opponent = self.env.obs_agent_two()
                     break
                 else:
-                    self.last_observation_1 = new_state
-                    self.last_observation_2 = self.env.obs_agent_two()
+                    self.last_observation_agent = new_state
+                    self.last_observation_opponent = self.env.obs_agent_two()
 
         return step_idx
             
@@ -261,7 +296,14 @@ class TD3Algorithm():
 
         for _ in range(num_steps):
             # Sample a mini-batch from the replay buffer and move tensors to the current device
-            batch = self.replay_buffer.sample(bs)
+            if isinstance(self.replay_buffer, PrioritizedReplayBuffer):
+                batch, weights, indices = self.replay_buffer.sample(bs, self.beta)
+
+            else:
+                batch = self.replay_buffer.sample(bs)
+                weights = np.ones(bs) # 1/m for all samples
+
+            weights_t = torch.from_numpy(weights).to(self.device)
             obs_batch = batch[0].to(self.device)
             action_batch = batch[1].to(self.device)
             next_obs_batch = batch[2].to(self.device)
@@ -286,9 +328,15 @@ class TD3Algorithm():
 
             # Get current Q estimates from both critics
             current_q1, current_q2 = self.agent.critic(obs_batch, action_batch)
-            loss_q1 = F.mse_loss(current_q1, td_target)
-            loss_q2 = F.mse_loss(current_q2, td_target)
-            critic_loss = (loss_q1 + loss_q2)
+            loss_q1 = F.mse_loss(current_q1, td_target, reduction='none')
+            loss_q2 = F.mse_loss(current_q2, td_target, reduction='none')
+            critic_loss_ew = loss_q1 + loss_q2
+            critic_loss = (critic_loss_ew * weights_t).mean()
+
+            if isinstance(self.replay_buffer, PrioritizedReplayBuffer):
+                # Also update the priorities in the replay buffer
+                new_priorities = critic_loss_ew.detach().cpu().numpy() + 1e-5 # Loss shouldnt be 0 therefore add small value
+                self.replay_buffer.update_priorities(indices, new_priorities)
 
             # Log critic loss and update the critic network
             critic_loss_history.append(critic_loss.item())
@@ -314,7 +362,6 @@ class TD3Algorithm():
 
             if self.num_timesteps % 100000 == 0:
                 self.agent.eval()
-
                 results = evaluate_multiple_opponents(
                     self.env,
                     self.agent,
@@ -322,6 +369,8 @@ class TD3Algorithm():
                     self.n_eval,
                     base_tag="",
                 )
+
+                logging.info(f"Step {self.num_timesteps}: {results}")
 
                 for k,v in results.items():
                     self.writer.add_scalar(k, v, self.num_timesteps)
@@ -333,11 +382,17 @@ class TD3Algorithm():
                 if results["win_percentage_strong"] >= self.best_win_percentage_strong:
                     self.best_win_percentage_strong = results["win_percentage_strong"]
 
+                if self.self_train and self.best_win_percentage_strong > self.self_playing_threshold:
+                    logging.info(f"[Time step: {self.num_timesteps}] Adding the best agent to self-training pool with win percentage {results['win_percentage_strong']}")
+                    self.self_training_opponents.append(copy.deepcopy(self.agent))
+                    if len(self.self_training_opponents) > self.self_training_max_agents:
+                        self.self_training_opponents.pop(0)
                 self.agent.train()               
 
             if self.num_timesteps % self.log_config["save_interval"] == 0 and self.log_config["model_chkpt_folder"] is not None:
-                self.save(self.log_config["model_chkpt_folder"])
-                self.save(self.log_config["model_chkpt_folder"], self.best_agent, f"_best_{self.num_timesteps}")
+                logging.info(f"Saving model at timestep {self.num_timesteps}")
+                self.save(self.log_config["model_chkpt_folder"], self.log_config["model_name"])
+                self.save(self.log_config["model_chkpt_folder"], self.log_config["model_name"], self.best_agent, f"best_{self.num_timesteps}")
             self.num_timesteps += 1
         self.num_eps += 1
 
@@ -349,35 +404,36 @@ class TD3Algorithm():
             avg_critic_loss = np.mean(critic_loss_history)
             self.writer.add_scalar("losses/critic_loss", avg_critic_loss, self.num_eps)
         
-    def save(self, folder, agent = None, appendix = ""):
+    def save(self, checkpoint_folder, model_name, agent = None, appendix = ""):
         if agent is None:
             agent = self.agent
-        filename = os.path.join(folder, f"{appendix}_model")
-        self.agent.save(filename, appendix)
-        torch.save(self.critic_optimizer.state_dict(), filename + f"{appendix}_critic_optimizer")
-        torch.save(self.actor_optimizer.state_dict(), filename + f"{appendix}_actor_optimizer")
+        filename = os.path.join(checkpoint_folder, model_name)
+        self.agent.save(checkpoint_folder, model_name, appendix)
+        torch.save(self.critic_optimizer.state_dict(), filename + f"_{appendix}_critic_optimizer")
+        torch.save(self.actor_optimizer.state_dict(), filename + f"_{appendix}_actor_optimizer")
 
-    def load(self, folder, agent = None, appendix = ""):
+    def load(self, checkpoint_folder, model_name, agent = None, appendix = ""):
         if agent is None:
             agent = self.agent
-        filename = os.path.join(folder, "model")
-        self.agent.load(filename, appendix)
-        self.critic_optimizer.load_state_dict(torch.load(filename + f"{appendix}_critic_optimizer"))
-        self.actor_optimizer.load_state_dict(torch.load(filename + f"{appendix}_actor_optimizer"))
+        filename = os.path.join(checkpoint_folder, model_name)
+        self.agent.load(checkpoint_folder, model_name, appendix)
+        self.critic_optimizer.load_state_dict(torch.load(filename + f"_{appendix}_critic_optimizer"))
+        self.actor_optimizer.load_state_dict(torch.load(filename + f"_{appendix}_actor_optimizer"))
         
-    def evaluate(self,env, opponents, n_eval):
+    def evaluate(self,env, opponents, n_eval, record_video = False):
         results = evaluate_multiple_opponents(
             env,
             self.agent,
             opponents,
             n_eval,
             base_tag="",
-            record_video=True,
+            record_video=record_video,
         )
         return results
 
 
 def run_episode(env, player, rival, dense_reward_func, video_storage):
+
     # Reset environment and optionally reset agent memory
     cum_reward = 0
     cum_dense = 0
@@ -441,7 +497,7 @@ def evaluate_agent_against_opponent(env, player, opponent, num_episodes, tag, re
     # Build result keys with tag if provided
     key_sparse = "avg_sparse_reward" + ("_" + tag if tag else "")
     key_dense = "avg_dense_reward" + ("_" + tag if tag else "")
-    key_win = "win_rate" + ("_" + tag if tag else "")
+    key_win = "win_percentage" + ("_" + tag if tag else "")
     
     return {
         key_sparse: avg_sparse,
@@ -453,6 +509,9 @@ def evaluate_multiple_opponents(env, player, opponents_list, num_episodes, base_
     overall_results = {}
     win_rates = []
     
+    if len(opponents_list) == 0:
+        return overall_results
+    
     for foe in opponents_list:
         foe_tag = foe.agent_config["name"]
         if base_tag:
@@ -461,7 +520,7 @@ def evaluate_multiple_opponents(env, player, opponents_list, num_episodes, base_
         overall_results.update(outcome)
         # Extract win rate for overall average calculation
         for key, value in outcome.items():
-            if "win_rate" in key:
+            if "win_percentage" in key:
                 win_rates.append(value)
     
     overall_win = np.mean(win_rates)
